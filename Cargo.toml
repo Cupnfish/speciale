@@ -2,7 +2,12 @@
 name = "speciale"
 version = "0.1.0"
 edition = "2024"
-authors = ["cupnfish@icloud.com"]
+authors = ["Cupnfish <cupnfish@icloud.com>"]
+description = "MCP server for DeepSeek-V3.2-Speciale reasoning model"
+repository = "https://github.com/Cupnfish/speciale"
+license = "MIT"
+keywords = ["mcp", "deepseek", "ai", "reasoning"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 rmcp = { version = "0.10", features = ["server", "transport-io", "macros"] }

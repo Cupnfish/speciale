@@ -571,4 +571,51 @@ mod tests {
         let json = serde_json::to_string(&msg_no_reasoning).unwrap();
         assert!(!json.contains("reasoning_content"));
     }
+
+    #[test]
+    fn test_multi_turn_messages_include_reasoning() {
+        // Simulate loading messages from DB for multi-turn conversation
+        let messages: Vec<ChatMessage> = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "What is 2+2?".to_string(),
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "4".to_string(),
+                reasoning_content: Some("Let me calculate: 2+2=4".to_string()),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "And 3+3?".to_string(),
+                reasoning_content: None,
+            },
+        ];
+
+        // Build API request
+        let request = ChatRequest {
+            model: "deepseek-reasoner".to_string(),
+            messages,
+            max_tokens: Some(1000),
+        };
+
+        let json = serde_json::to_string_pretty(&request).unwrap();
+        
+        // Verify reasoning_content is included for assistant message
+        assert!(json.contains("reasoning_content"));
+        assert!(json.contains("Let me calculate: 2+2=4"));
+        
+        // Verify user messages don't have reasoning_content in JSON
+        // (skip_serializing_if = "Option::is_none" works)
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        
+        // User message (index 0) should NOT have reasoning_content key
+        assert!(messages[0].get("reasoning_content").is_none());
+        
+        // Assistant message (index 1) SHOULD have reasoning_content
+        assert!(messages[1].get("reasoning_content").is_some());
+        assert_eq!(messages[1]["reasoning_content"], "Let me calculate: 2+2=4");
+    }
 }
