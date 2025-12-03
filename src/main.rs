@@ -126,6 +126,8 @@ pub struct AskResponse {
     pub tip: String,
 }
 
+const MAX_RETRIES: u32 = 3;
+
 async fn call_deepseek(
     client: &reqwest::Client,
     api_key: &str,
@@ -137,44 +139,75 @@ async fn call_deepseek(
         max_tokens: Some(DEFAULT_MAX_TOKENS),
     };
 
+    let mut last_error = None;
+    
+    for attempt in 1..=MAX_RETRIES {
+        let result = do_request(client, api_key, &request).await;
+        
+        match result {
+            Ok((content, reasoning, tokens)) => {
+                // Retry if content is empty
+                if content.is_empty() && attempt < MAX_RETRIES {
+                    last_error = Some("Empty content from model".to_string());
+                    continue;
+                }
+                return Ok((content, reasoning, tokens));
+            }
+            Err(e) => {
+                last_error = Some(e.clone());
+                // Don't retry on client errors (4xx)
+                if e.contains("API error 4") {
+                    return Err(McpError {
+                        code: ErrorCode::INTERNAL_ERROR,
+                        message: Cow::from(e),
+                        data: None,
+                    });
+                }
+                // Retry on other errors
+                if attempt < MAX_RETRIES {
+                    continue;
+                }
+            }
+        }
+    }
+
+    Err(McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: Cow::from(format!("Failed after {} retries: {}", MAX_RETRIES, last_error.unwrap_or_default())),
+        data: None,
+    })
+}
+
+async fn do_request(
+    client: &reqwest::Client,
+    api_key: &str,
+    request: &ChatRequest,
+) -> Result<(String, Option<String>, u32), String> {
     let response = client
         .post(format!("{}/chat/completions", DEEPSEEK_BASE_URL))
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
-        .json(&request)
+        .json(request)
         .send()
         .await
-        .map_err(|e| McpError {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: Cow::from(format!("Request failed: {}", e)),
-            data: None,
-        })?;
+        .map_err(|e| format!("Request failed: {}", e))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(McpError {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: Cow::from(format!("API error {}: {}", status, text)),
-            data: None,
-        });
+        return Err(format!("API error {}: {}", status, text));
     }
 
-    let chat_response: ChatResponse = response.json().await.map_err(|e| McpError {
-        code: ErrorCode::INTERNAL_ERROR,
-        message: Cow::from(format!("Failed to parse response: {}", e)),
-        data: None,
-    })?;
+    let chat_response: ChatResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     let choice = chat_response
         .choices
         .into_iter()
         .next()
-        .ok_or_else(|| McpError {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: Cow::from("No response from model"),
-            data: None,
-        })?;
+        .ok_or_else(|| "No response from model".to_string())?;
 
     let total_tokens = chat_response.usage.map(|u| u.total_tokens).unwrap_or(0);
     Ok((
