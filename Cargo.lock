@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "speciale"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "duckdb",
@@ -2050,6 +2050,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]

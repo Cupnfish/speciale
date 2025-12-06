@@ -1,40 +1,43 @@
 # Speciale
 
-[![Crates.io](https://img.shields.io/crates/v/speciale.svg)](https://crates.io/crates/speciale)
+[![Release](https://img.shields.io/github/v/release/Cupnfish/speciale)](https://github.com/Cupnfish/speciale/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-MCP server for [DeepSeek-V3.2-Speciale](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode), a powerful reasoning model with deep thinking capabilities.
+MCP server for [DeepSeek-V3.2-Speciale](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode), a powerful reasoning model.
 
 ## Features
 
 - Deep reasoning for complex math, code analysis, logical problems
+- **File references**: `@path` syntax for files and directories
+- **Grep search**: `@grep:pattern` syntax using ripgrep/grep
 - Multi-turn conversations with persistence
-- Context tracking (token usage)
 - Local storage in DuckDB (`~/.speciale/conversations.db`)
 
 ## Installation
 
-### From crates.io
+### Download from GitHub Releases
+
+Download the latest binary for your platform from [Releases](https://github.com/Cupnfish/speciale/releases):
+
+| Platform | File |
+|----------|------|
+| Linux x86_64 | `speciale-linux-x86_64` |
+| Linux ARM64 | `speciale-linux-aarch64` |
+| macOS Intel | `speciale-darwin-x86_64` |
+| macOS Apple Silicon | `speciale-darwin-aarch64` |
+| Windows | `speciale-windows-x86_64.exe` |
 
 ```bash
-cargo install speciale
+# Example for macOS Apple Silicon
+curl -L https://github.com/Cupnfish/speciale/releases/latest/download/speciale-darwin-aarch64 -o speciale
+chmod +x speciale
+sudo mv speciale /usr/local/bin/
 ```
 
-### From source
+### Build from source
 
 ```bash
-git clone https://github.com/Cupnfish/speciale.git
-cd speciale
-cargo install --path .
-```
-
-### Build only
-
-```bash
-git clone https://github.com/Cupnfish/speciale.git
-cd speciale
-cargo build --release
-# Binary at: target/release/speciale
+cargo install --git https://github.com/Cupnfish/speciale.git
 ```
 
 ## Configuration
@@ -47,15 +50,36 @@ export DEEPSEEK_API_KEY="your-api-key"
 
 ## MCP Client Setup
 
-### Claude Code
+### Claude Code (CLI)
 
-Add to `~/.claude/claude_desktop_config.json`:
+The easiest way - automatically uses current directory:
 
+**macOS/Linux:**
+```bash
+claude mcp add speciale -e DEEPSEEK_API_KEY=your-api-key -- speciale --pwd $(pwd)
+```
+
+**Windows (PowerShell):**
+```powershell
+claude mcp add speciale -e DEEPSEEK_API_KEY=your-api-key -- speciale --pwd $PWD
+```
+
+**Windows (CMD):**
+```cmd
+claude mcp add speciale -e DEEPSEEK_API_KEY=your-api-key -- speciale --pwd %cd%
+```
+
+### Claude Code (Config File)
+
+Edit `~/.claude.json`:
+
+**macOS/Linux:**
 ```json
 {
   "mcpServers": {
     "speciale": {
-      "command": "speciale",
+      "command": "bash",
+      "args": ["-c", "speciale --pwd \"$PWD\""],
       "env": {
         "DEEPSEEK_API_KEY": "your-api-key"
       }
@@ -64,13 +88,13 @@ Add to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Or with full path:
-
+**Windows:**
 ```json
 {
   "mcpServers": {
     "speciale": {
-      "command": "/Users/yourname/.cargo/bin/speciale",
+      "command": "cmd",
+      "args": ["/c", "speciale --pwd %cd%"],
       "env": {
         "DEEPSEEK_API_KEY": "your-api-key"
       }
@@ -81,13 +105,15 @@ Or with full path:
 
 ### Cursor
 
-Add to `~/.cursor/mcp.json`:
+Edit `~/.cursor/mcp.json`:
 
+**macOS/Linux:**
 ```json
 {
   "mcpServers": {
     "speciale": {
-      "command": "speciale",
+      "command": "bash",
+      "args": ["-c", "speciale --pwd \"$PWD\""],
       "env": {
         "DEEPSEEK_API_KEY": "your-api-key"
       }
@@ -98,7 +124,7 @@ Add to `~/.cursor/mcp.json`:
 
 ### Claude Desktop
 
-Config file location:
+Config locations:
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
@@ -107,6 +133,7 @@ Config file location:
   "mcpServers": {
     "speciale": {
       "command": "speciale",
+      "args": ["--pwd", "/path/to/your/project"],
       "env": {
         "DEEPSEEK_API_KEY": "your-api-key"
       }
@@ -115,74 +142,62 @@ Config file location:
 }
 ```
 
+> **Note**: Claude Desktop doesn't support dynamic PWD injection. Specify the project path directly.
+
+## Reference Syntax
+
+| Syntax | Description |
+|--------|-------------|
+| `@src/main.rs` | Include a single file |
+| `@src/` | Include all files in directory (recursive) |
+| `@grep:pattern` | Search with ripgrep (fallback to grep) |
+| `@grep:pattern:*.rs` | Search with glob filter |
+
+**Examples:**
+```
+Review @src/main.rs for bugs
+Analyze all code in @src/
+Find usages of @grep:async_fn
+Search in Rust files @grep:impl:*.rs
+```
+
+> **Tip**: Only use `@` syntax when entire file content is needed. For small snippets, include them directly in your question.
+
 ## Tool: ask_speciale
 
 ### Parameters
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `question` | string | Yes | The question. Include ALL relevant context. |
+| `question` | string | Yes | Use `@` syntax to include files/searches |
 | `system_prompt` | string | No | System prompt (new conversations only) |
-| `include_reasoning` | boolean | No | Show reasoning process (default: false) |
-| `conversation_id` | string | No | Continue a previous conversation |
+| `include_reasoning` | boolean | No | Show reasoning (default: false) |
+| `conversation_id` | string | No | Continue previous conversation |
 
 ### Response
 
 ```json
 {
-  "answer": "The model's response",
-  "reasoning": "Reasoning process (if include_reasoning=true)",
-  "conversation_id": "uuid-for-follow-ups",
+  "answer": "Response",
+  "reasoning": "If requested",
+  "conversation_id": "uuid",
   "context_tokens": 1234,
   "max_context_tokens": 131072,
-  "tip": "Context usage or follow-up instructions"
+  "tip": "Usage info"
 }
 ```
 
-### Example
+## Important
 
-**New conversation:**
-```json
-{
-  "question": "Analyze this code:\n```python\ndef calc(x):\n    return x / 0\n```"
-}
-```
-
-**Follow-up:**
-```json
-{
-  "question": "How to fix it?",
-  "conversation_id": "uuid-from-previous-response"
-}
-```
-
-## Important Notes
-
-> **This model has NO external access and CANNOT call tools.**
-
-Always include complete context in your question:
-- Full code snippets (not references)
-- Relevant data and examples  
-- Background information
-- Specific requirements
-
-The model can only reason based on what you provide.
-
-## Best Use Cases
-
-- Complex mathematical problems
-- Code review and analysis
-- Logical reasoning tasks
-- Algorithm design
-- Debugging (with full code provided)
-- Detailed explanations
+**This model has NO external access and CANNOT call tools.** It can only reason based on what you provide.
 
 ## License
 
-MIT - see [LICENSE](LICENSE)
+MIT
 
 ## Links
 
-- [GitHub Repository](https://github.com/Cupnfish/speciale)
-- [DeepSeek API Docs](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode)
+- [GitHub](https://github.com/Cupnfish/speciale)
+- [Releases](https://github.com/Cupnfish/speciale/releases)
+- [DeepSeek API](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode)
 - [MCP Protocol](https://modelcontextprotocol.io/)

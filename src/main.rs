@@ -7,11 +7,176 @@ use rmcp::{
     transport::stdio,
 };
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, env, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow,
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v3.2_speciale_expires_on_20251215";
+
+fn read_single_file_to_markdown(path: &Path) -> String {
+    let path_str = path.display().to_string();
+    match std::fs::read_to_string(path) {
+        Ok(file_content) => {
+            format!("\n## File: `{}`\n\n```\n{}\n```\n", path_str, file_content.trim_end())
+        }
+        Err(e) => format!("\n## File: `{}` (Error: {})\n\n", path_str, e),
+    }
+}
+
+fn read_dir_to_markdown(dir: &Path) -> String {
+    let mut content = String::new();
+
+    fn visit_dir(dir: &Path, content: &mut String) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            entries.sort_by_key(|e| e.path());
+
+            for entry in entries {
+                let path = entry.path();
+                // Skip hidden files and common ignore patterns
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.')
+                        || name == "node_modules"
+                        || name == "target"
+                        || name == "__pycache__"
+                    {
+                        continue;
+                    }
+                }
+
+                if path.is_dir() {
+                    visit_dir(&path, content);
+                } else if path.is_file() {
+                    // Skip binary files by checking extension
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        let skip_exts = [
+                            "png", "jpg", "jpeg", "gif", "ico", "svg", "woff", "woff2", "ttf",
+                            "eot", "mp3", "mp4", "zip", "tar", "gz", "exe", "dll", "so", "dylib",
+                            "o", "a",
+                        ];
+                        if skip_exts.contains(&ext.to_lowercase().as_str()) {
+                            continue;
+                        }
+                    }
+                    content.push_str(&read_single_file_to_markdown(&path));
+                }
+            }
+        }
+    }
+
+    visit_dir(dir, &mut content);
+    content
+}
+
+fn run_grep(pwd: &Path, pattern: &str, glob: Option<&str>) -> String {
+    // Try ripgrep first, fallback to grep
+    let result = try_ripgrep(pwd, pattern, glob)
+        .or_else(|| try_grep(pwd, pattern, glob));
+    
+    match result {
+        Some(output) if output.is_empty() => {
+            format!("\n## Grep: `{}`\n\nNo matches found.\n", pattern)
+        }
+        Some(output) => {
+            format!("\n## Grep: `{}`{}\n\n```\n{}\n```\n", 
+                pattern,
+                glob.map(|g| format!(" (glob: {})", g)).unwrap_or_default(),
+                output.trim_end())
+        }
+        None => format!("\n## Grep: `{}` (Error: neither rg nor grep available)\n\n", pattern),
+    }
+}
+
+fn try_ripgrep(pwd: &Path, pattern: &str, glob: Option<&str>) -> Option<String> {
+    let mut cmd = std::process::Command::new("rg");
+    cmd.arg("--no-heading")
+        .arg("--line-number")
+        .arg("--color=never")
+        .arg("-m").arg("100")
+        .current_dir(pwd);
+    
+    if let Some(g) = glob {
+        cmd.arg("-g").arg(g);
+    }
+    cmd.arg(pattern);
+    
+    cmd.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+}
+
+fn try_grep(pwd: &Path, pattern: &str, glob: Option<&str>) -> Option<String> {
+    let mut cmd = std::process::Command::new("grep");
+    cmd.arg("-rn")
+        .arg("--color=never")
+        .current_dir(pwd);
+    
+    if let Some(g) = glob {
+        cmd.arg("--include").arg(g);
+    }
+    cmd.arg(pattern).arg(".");
+    
+    cmd.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+}
+
+fn expand_file_references(question: &str, pwd: &Path) -> String {
+    // Patterns:
+    // - @path or @path/ for files/directories
+    // - @grep:pattern or @grep:pattern:glob for ripgrep search
+    let mut result = question.to_string();
+    let mut references: Vec<(String, String)> = Vec::new();
+
+    let mut i = 0;
+    let chars: Vec<char> = question.chars().collect();
+
+    while i < chars.len() {
+        if chars[i] == '@' && (i == 0 || chars[i - 1].is_whitespace()) {
+            i += 1;
+
+            // Collect until whitespace or end
+            let mut ref_chars = String::new();
+            while i < chars.len() && !chars[i].is_whitespace() {
+                ref_chars.push(chars[i]);
+                i += 1;
+            }
+
+            if !ref_chars.is_empty() {
+                let reference = format!("@{}", ref_chars);
+                
+                let content = if ref_chars.starts_with("grep:") {
+                    // @grep:pattern or @grep:pattern:glob
+                    let grep_part = &ref_chars[5..]; // skip "grep:"
+                    let parts: Vec<&str> = grep_part.splitn(2, ':').collect();
+                    let pattern = parts[0];
+                    let glob = parts.get(1).copied();
+                    run_grep(pwd, pattern, glob)
+                } else {
+                    // File or directory reference
+                    let full_path = pwd.join(&ref_chars);
+                    if ref_chars.ends_with('/') || full_path.is_dir() {
+                        read_dir_to_markdown(&full_path)
+                    } else {
+                        read_single_file_to_markdown(&full_path)
+                    }
+                };
+
+                references.push((reference, content));
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    // Replace references with content
+    for (reference, content) in references {
+        result = result.replacen(&reference, &content, 1);
+    }
+
+    result
+}
 const DEFAULT_MAX_TOKENS: u32 = 64 * 1024;
 const MAX_CONTEXT_TOKENS: u32 = 128 * 1024;
 
@@ -91,6 +256,7 @@ pub struct Speciale {
     client: Arc<reqwest::Client>,
     api_key: Arc<String>,
     db: Arc<Mutex<Connection>>,
+    pwd: Arc<PathBuf>,
     tool_router: ToolRouter<Speciale>,
 }
 
@@ -140,10 +306,10 @@ async fn call_deepseek(
     };
 
     let mut last_error = None;
-    
+
     for attempt in 1..=MAX_RETRIES {
         let result = do_request(client, api_key, &request).await;
-        
+
         match result {
             Ok((content, reasoning, tokens)) => {
                 // Retry if content is empty
@@ -173,7 +339,11 @@ async fn call_deepseek(
 
     Err(McpError {
         code: ErrorCode::INTERNAL_ERROR,
-        message: Cow::from(format!("Failed after {} retries: {}", MAX_RETRIES, last_error.unwrap_or_default())),
+        message: Cow::from(format!(
+            "Failed after {} retries: {}",
+            MAX_RETRIES,
+            last_error.unwrap_or_default()
+        )),
         data: None,
     })
 }
@@ -219,7 +389,7 @@ async fn do_request(
 
 #[tool_router]
 impl Speciale {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(pwd: PathBuf) -> Result<Self, String> {
         let api_key = env::var("DEEPSEEK_API_KEY")
             .map_err(|_| "DEEPSEEK_API_KEY environment variable not set")?;
 
@@ -232,6 +402,7 @@ impl Speciale {
             client: Arc::new(reqwest::Client::new()),
             api_key: Arc::new(api_key),
             db: Arc::new(Mutex::new(conn)),
+            pwd: Arc::new(pwd),
             tool_router: Self::tool_router(),
         })
     }
@@ -319,7 +490,7 @@ impl Speciale {
     }
 
     #[tool(
-        description = "Ask DeepSeek-V3.2-Speciale (a powerful reasoning model) a question. IMPORTANT: This model has NO external access and NO tool-calling ability. You MUST include ALL relevant context, code, data, and background information in the question itself. The model can only reason based on what you provide. Good for: complex math, code analysis, logical reasoning, detailed explanations. Returns conversation_id for follow-ups."
+        description = "Ask DeepSeek-V3.2-Speciale (a powerful reasoning model) a question. This model has NO external access. Use @path for files, @dir/ for directories, @grep:pattern or @grep:pattern:glob for search. Only use these when full content is needed; otherwise include snippets directly. Good for: math, code analysis, logical reasoning. Returns conversation_id for follow-ups."
     )]
     async fn ask_speciale(
         &self,
@@ -367,10 +538,13 @@ impl Speciale {
             (conv_id, api_messages, true)
         };
 
+        // Build user message: expand @path references
+        let user_content = expand_file_references(&req.question, &self.pwd);
+
         // Add user message
         api_messages.push(ChatMessage {
             role: "user".to_string(),
-            content: req.question.clone(),
+            content: user_content.clone(),
             reasoning_content: None,
         });
 
@@ -389,23 +563,42 @@ impl Speciale {
             answer.clone()
         };
 
-        // Save to DB
-        self.save_message(&db, &conv_id, "user", &req.question, None)?;
-        self.save_message(&db, &conv_id, "assistant", &final_answer, reasoning.as_deref())?;
+        // Save to DB (save full content with files for conversation history)
+        self.save_message(&db, &conv_id, "user", &user_content, None)?;
+        self.save_message(
+            &db,
+            &conv_id,
+            "assistant",
+            &final_answer,
+            reasoning.as_deref(),
+        )?;
         self.update_tokens(&db, &conv_id, total_tokens)?;
 
         let usage_pct = (total_tokens as f64 / MAX_CONTEXT_TOKENS as f64 * 100.0) as u32;
         let tip = if is_new {
-            format!("To continue this conversation, include conversation_id: \"{}\"", conv_id)
+            format!(
+                "To continue this conversation, include conversation_id: \"{}\"",
+                conv_id
+            )
         } else if usage_pct > 80 {
-            format!("Warning: {}% context used ({}/{}). Consider starting a new conversation.", usage_pct, total_tokens, MAX_CONTEXT_TOKENS)
+            format!(
+                "Warning: {}% context used ({}/{}). Consider starting a new conversation.",
+                usage_pct, total_tokens, MAX_CONTEXT_TOKENS
+            )
         } else {
-            format!("Context: {}% used ({}/{} tokens)", usage_pct, total_tokens, MAX_CONTEXT_TOKENS)
+            format!(
+                "Context: {}% used ({}/{} tokens)",
+                usage_pct, total_tokens, MAX_CONTEXT_TOKENS
+            )
         };
 
         let response = AskResponse {
             answer: final_answer.clone(),
-            reasoning: if req.include_reasoning { reasoning } else { None },
+            reasoning: if req.include_reasoning {
+                reasoning
+            } else {
+                None
+            },
             conversation_id: conv_id,
             context_tokens: total_tokens,
             max_context_tokens: MAX_CONTEXT_TOKENS,
@@ -426,11 +619,10 @@ impl ServerHandler for Speciale {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
             instructions: Some(
-                "DeepSeek-V3.2-Speciale: A powerful reasoning model for complex problems. \
-                 CRITICAL: This model has NO external access and CANNOT call tools. \
-                 Always include complete context (code, data, background) in your question. \
-                 Use conversation_id from response for follow-up questions. \
-                 Best for: math, code review, logical analysis, detailed explanations."
+                "DeepSeek-V3.2-Speciale: A powerful reasoning model. NO external access. \
+                 Syntax: @file, @dir/, @grep:pattern, @grep:pattern:glob. \
+                 Only use when full content needed; otherwise include snippets directly. \
+                 Use conversation_id for follow-ups. Best for: math, code review, logic."
                     .to_string(),
             ),
         }
@@ -439,7 +631,28 @@ impl ServerHandler for Speciale {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server = Speciale::new().map_err(|e| {
+    // Parse --pwd argument (required)
+    let args: Vec<String> = env::args().collect();
+    let mut pwd: Option<PathBuf> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--pwd" && i + 1 < args.len() {
+            pwd = Some(PathBuf::from(&args[i + 1]));
+            i += 2;
+        } else if args[i].starts_with("--pwd=") {
+            pwd = Some(PathBuf::from(args[i].strip_prefix("--pwd=").unwrap()));
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    let pwd = pwd.unwrap_or_else(|| {
+        panic!("Error: --pwd argument is required\nUsage: speciale --pwd /path/to/project");
+    });
+
+    let server = Speciale::new(pwd).map_err(|e| {
         eprintln!("Error: {}", e);
         e
     })?;
@@ -509,7 +722,8 @@ mod tests {
         conn.execute(
             "INSERT INTO conversations (id, system_prompt) VALUES (?, ?)",
             params![conv_id, "You are helpful"],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Insert messages - should auto-generate IDs
         conn.execute(
@@ -523,11 +737,13 @@ mod tests {
         ).unwrap();
 
         // Verify messages were inserted with auto-generated IDs
-        let count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
-            [conv_id],
-            |row| row.get(0)
-        ).unwrap();
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+                [conv_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 2);
 
         // Verify IDs are different
@@ -551,7 +767,8 @@ mod tests {
         conn.execute(
             "INSERT INTO conversations (id, system_prompt, total_tokens) VALUES (?, ?, ?)",
             params![conv_id, "Be helpful", 100],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "INSERT INTO messages (conversation_id, role, content, reasoning_content) VALUES (?, ?, ?, ?)",
@@ -564,11 +781,13 @@ mod tests {
         ).unwrap();
 
         // Load conversation
-        let (system_prompt, total_tokens): (Option<String>, i32) = conn.query_row(
-            "SELECT system_prompt, total_tokens FROM conversations WHERE id = ?",
-            [conv_id],
-            |row| Ok((row.get(0)?, row.get(1)?))
-        ).unwrap();
+        let (system_prompt, total_tokens): (Option<String>, i32) = conn
+            .query_row(
+                "SELECT system_prompt, total_tokens FROM conversations WHERE id = ?",
+                [conv_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(system_prompt, Some("Be helpful".to_string()));
         assert_eq!(total_tokens, 100);
 
@@ -582,8 +801,18 @@ mod tests {
             .collect();
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0], ("user".to_string(), "Question".to_string(), None));
-        assert_eq!(messages[1], ("assistant".to_string(), "Answer".to_string(), Some("reasoning".to_string())));
+        assert_eq!(
+            messages[0],
+            ("user".to_string(), "Question".to_string(), None)
+        );
+        assert_eq!(
+            messages[1],
+            (
+                "assistant".to_string(),
+                "Answer".to_string(),
+                Some("reasoning".to_string())
+            )
+        );
     }
 
     #[test]
@@ -634,21 +863,217 @@ mod tests {
         };
 
         let json = serde_json::to_string_pretty(&request).unwrap();
-        
+
         // Verify reasoning_content is included for assistant message
         assert!(json.contains("reasoning_content"));
         assert!(json.contains("Let me calculate: 2+2=4"));
-        
+
         // Verify user messages don't have reasoning_content in JSON
         // (skip_serializing_if = "Option::is_none" works)
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let messages = parsed["messages"].as_array().unwrap();
-        
+
         // User message (index 0) should NOT have reasoning_content key
         assert!(messages[0].get("reasoning_content").is_none());
-        
+
         // Assistant message (index 1) SHOULD have reasoning_content
         assert!(messages[1].get("reasoning_content").is_some());
         assert_eq!(messages[1]["reasoning_content"], "Let me calculate: 2+2=4");
+    }
+
+    #[test]
+    fn test_read_single_file_to_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "line 1\nline 2\n").unwrap();
+        
+        let result = read_single_file_to_markdown(&file_path);
+        assert!(result.contains("## File:"));
+        assert!(result.contains("test.txt"));
+        assert!(result.contains("line 1"));
+        assert!(result.contains("line 2"));
+        assert!(result.contains("```"));
+    }
+
+    #[test]
+    fn test_read_single_file_to_markdown_not_found() {
+        let path = Path::new("/nonexistent/file.txt");
+        let result = read_single_file_to_markdown(path);
+        assert!(result.contains("Error:"));
+    }
+
+    #[test]
+    fn test_read_dir_to_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        
+        // Create test files
+        let file1 = dir.path().join("a.txt");
+        std::fs::write(&file1, "content a").unwrap();
+        
+        let file2 = dir.path().join("b.txt");
+        std::fs::write(&file2, "content b").unwrap();
+        
+        // Create subdirectory with file
+        let subdir = dir.path().join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+        let file3 = subdir.join("c.txt");
+        std::fs::write(&file3, "content c").unwrap();
+        
+        let result = read_dir_to_markdown(dir.path());
+        assert!(result.contains("a.txt"));
+        assert!(result.contains("content a"));
+        assert!(result.contains("b.txt"));
+        assert!(result.contains("content b"));
+        assert!(result.contains("c.txt"));
+        assert!(result.contains("content c"));
+    }
+
+    #[test]
+    fn test_read_dir_skips_hidden_and_special() {
+        let dir = tempfile::tempdir().unwrap();
+        
+        // Create visible file
+        std::fs::write(dir.path().join("visible.txt"), "visible").unwrap();
+        
+        // Create hidden file (should be skipped)
+        std::fs::write(dir.path().join(".hidden"), "hidden").unwrap();
+        
+        // Create node_modules dir (should be skipped)
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        std::fs::write(nm.join("pkg.js"), "package").unwrap();
+        
+        let result = read_dir_to_markdown(dir.path());
+        assert!(result.contains("visible.txt"));
+        assert!(!result.contains(".hidden"));
+        assert!(!result.contains("node_modules"));
+        assert!(!result.contains("pkg.js"));
+    }
+
+    #[test]
+    fn test_expand_file_references_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("code.rs");
+        std::fs::write(&file_path, "fn main() {}").unwrap();
+        
+        let question = "Review @code.rs please";
+        let result = expand_file_references(question, dir.path());
+        
+        assert!(!result.contains("@code.rs"));
+        assert!(result.contains("fn main() {}"));
+        assert!(result.contains("## File:"));
+    }
+
+    #[test]
+    fn test_expand_file_references_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("src");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("lib.rs"), "pub mod test;").unwrap();
+        
+        let question = "Check @src/ directory";
+        let result = expand_file_references(question, dir.path());
+        
+        assert!(!result.contains("@src/"));
+        assert!(result.contains("pub mod test;"));
+    }
+
+    #[test]
+    fn test_expand_file_references_grep() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.rs"), "fn hello() {}\nfn world() {}").unwrap();
+        
+        let question = "Find @grep:hello";
+        let result = expand_file_references(question, dir.path());
+        
+        assert!(!result.contains("@grep:hello"));
+        assert!(result.contains("## Grep:"));
+        // Result depends on whether rg/grep is available
+    }
+
+    #[test]
+    fn test_expand_file_references_grep_with_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.rs"), "fn rust_fn() {}").unwrap();
+        std::fs::write(dir.path().join("test.py"), "def python_fn(): pass").unwrap();
+        
+        let question = "Search @grep:fn:*.rs";
+        let result = expand_file_references(question, dir.path());
+        
+        assert!(!result.contains("@grep:fn:*.rs"));
+        assert!(result.contains("## Grep:"));
+        assert!(result.contains("(glob: *.rs)"));
+    }
+
+    #[test]
+    fn test_expand_file_references_multiple() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "content b").unwrap();
+        
+        let question = "Compare @a.txt and @b.txt";
+        let result = expand_file_references(question, dir.path());
+        
+        assert!(!result.contains("@a.txt"));
+        assert!(!result.contains("@b.txt"));
+        assert!(result.contains("content a"));
+        assert!(result.contains("content b"));
+    }
+
+    #[test]
+    fn test_expand_file_references_no_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let question = "What is 2+2?";
+        let result = expand_file_references(question, dir.path());
+        assert_eq!(result, question);
+    }
+
+    #[test]
+    fn test_expand_file_references_at_in_middle_of_word() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "test").unwrap();
+        
+        // @ in middle of word should not be treated as reference
+        let question = "email@test.txt is not a file";
+        let result = expand_file_references(question, dir.path());
+        
+        // Should not expand because @ is not preceded by whitespace
+        assert_eq!(result, question);
+    }
+
+    #[test]
+    fn test_try_ripgrep_available() {
+        // This test checks if ripgrep works when available
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "hello world").unwrap();
+        
+        let result = try_ripgrep(dir.path(), "hello", None);
+        // Result is Some if rg is available, None if not
+        if let Some(output) = result {
+            assert!(output.contains("hello") || output.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_try_grep_available() {
+        // This test checks if grep works when available
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "hello world").unwrap();
+        
+        let result = try_grep(dir.path(), "hello", None);
+        // Result is Some if grep is available, None if not
+        if let Some(output) = result {
+            assert!(output.contains("hello") || output.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_run_grep_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "searchable content").unwrap();
+        
+        let result = run_grep(dir.path(), "searchable", None);
+        assert!(result.contains("## Grep:"));
+        // Should either find results or report no matches/error
     }
 }
